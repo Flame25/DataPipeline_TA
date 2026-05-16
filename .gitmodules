@@ -1,0 +1,6 @@
+[submodule "OpenFace-3.0"]
+	path = OpenFace-3.0
+	url = https://github.com/CMU-MultiComp-Lab/OpenFace-3.0.git
+[submodule "DI-Retinex"]
+	path = DI-Retinex
+	url = https://github.com/sunshangquan/DI-Retinex.git

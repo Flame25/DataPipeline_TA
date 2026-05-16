@@ -58,7 +58,7 @@ face_tracker = SmoothTracker(alpha=0.5)
 
 # ================= DI-RETINEX =================
 net = mymodel.enhance_net_nopool(6, 64).to(device)
-net.load_state_dict(torch.load("./DI-Retinex/weights/model.pth", map_location=device, weights_only=True))
+net.load_state_dict(torch.load("./DI-Retinex/weights/latest (21.54 lolv1).pth", map_location=device, weights_only=True))
 net.eval()
 
 # ================= INSIGHTFACE =================
