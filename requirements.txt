@@ -1,0 +1,12 @@
+grpcio==1.48.2
+grpcio-tools==1.48.2
+insightface==0.7.3
+mediapipe==0.10.5
+numpy==1.24.4
+onnxruntime-gpu==1.19.2  # <-- Changed to force GPU usage!
+opencv-python==4.9.0.80
+protobuf==3.20.3
+scikit-image==0.21.0
+scikit-learn==1.3.2
+torch==2.4.1             # <-- Pip will automatically download the Nvidia CUDA tools for this
+openface-test==0.1.13

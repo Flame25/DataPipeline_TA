@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+// The new service name
+service DataStreamService {
+  // The new function name
+  rpc SendFeatures (FeatureRequest) returns (FeatureResponse) {}
+}
+
+// The new payload structure
+message FeatureRequest {
+  repeated float features = 1;  // This will hold your [pca0...pca9, p_emotion0...p_emotionN] array
+  int64 timestamp = 2;
+}
+
+message FeatureResponse {
+  bool success = 1;
+  string message = 2;
+}
