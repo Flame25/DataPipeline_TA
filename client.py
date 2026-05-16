@@ -66,7 +66,7 @@ app = FaceAnalysis(name="buffalo_sc", providers=["CUDAExecutionProvider"])
 app.prepare(ctx_id=0, det_size=(320, 320))
 
 # ================= OPENFACE =================
-model = MultitaskPredictor(model_path="./OpenFace/weights/MTL_backbone.pth", device=device)
+model = MultitaskPredictor(model_path="./OpenFace-3.0/weights/MTL_backbone.pth", device=device)
 
 # ================= MEDIAPIPE & PSFP =================
 mp_face_mesh = mp.solutions.face_mesh
