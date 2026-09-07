@@ -1,14 +1,13 @@
 import sys
 import os
+import glob
+import re
 import cv2
 import time
 import torch
-import base64
 import numpy as np
 import threading
-import queue  # <-- Added for streaming queue
-import uvicorn
-from fastapi import FastAPI, Request
+import queue  # <-- Added for bidirectional stream queue
 import mediapipe as mp
 from skimage.feature import hog
 from sklearn.decomposition import PCA
@@ -30,39 +29,29 @@ import grpc
 SERVER = "localhost:50051"
 ALPHA = 0.4
 PCA_COMPONENTS = 60
-SKIP_FRAMES = 3 
-patch_size = 32
+DAISEE_IMAGE_PATH = "./balanced_daisee_frames"  # Path to folder containing 1100011002, etc.
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ================= gRPC BIDIRECTIONAL SETUP =================
-# Queue to safely pass payloads from FastAPI to the gRPC stream
-grpc_request_queue = queue.Queue(maxsize=30) 
-
-# Globals to hold the latest server responses
-latest_prediction = "Mengkalkulasi..."
-latest_probabilities = [0.0, 0.0, 0.0, 0.0]
+# Queue size set higher for dataset batch processing
+grpc_request_queue = queue.Queue(maxsize=100) 
 
 def request_generator():
     """Continuously yields frames from the queue to the gRPC server tunnel"""
     while True:
         item = grpc_request_queue.get()
-        if item is None:
+        if item is None:  # Sentinel value to gracefully close
             break
         yield item
 
 def prediction_listener(response_stream):
-    """Continuously listens for predictions sent back from the server"""
-    global latest_prediction, latest_probabilities
+    """Listens to server responses to keep the tunnel flowing smoothly."""
     try:
         for response in response_stream:
-            # If server sent probabilities, update them
-            if len(response.probabilities) > 0:
-                latest_prediction = response.predicted_class
-                latest_probabilities = list(response.probabilities)
-            else:
-                # Server is buffering, update status message
-                latest_prediction = response.predicted_class
+            # We don't need to print predictions on the screen for a training script,
+            # but we MUST read the stream to prevent the network buffer from clogging.
+            pass
     except grpc.RpcError as e:
         print(f"gRPC Stream Disconnected: {e}")
 
@@ -71,12 +60,10 @@ def start_grpc_stream():
     channel = grpc.insecure_channel(SERVER)
     stub = data_pb2_grpc.DataStreamServiceStub(channel)
     
-    # 1. Open tunnel and pass the generator
     response_stream = stub.StreamFeatures(request_generator())
-    
-    # 2. Start listener thread for incoming server predictions
     threading.Thread(target=prediction_listener, args=(response_stream,), daemon=True).start()
-    print("✅ gRPC Bidirectional Stream Started")
+    print("✅ gRPC Bidirectional Stream Started for Dataset Processing")
+    return channel
 
 # ================= TRACKING (EMA SMOOTHING) =================
 class SmoothTracker:
@@ -92,24 +79,25 @@ class SmoothTracker:
                         (self.bbox * (1.0 - self.alpha))
         return self.bbox.astype(int)
 
-face_tracker = SmoothTracker(alpha=0.5)
+    def reset(self):
+        self.bbox = None
+
+# ================= UTILS =================
+def natural_sort_key(s):
+    """Sorts strings containing numbers logically (e.g., frame_2.jpg before frame_10.jpg)"""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
 # ================= INITIALIZE MODELS =================
-print("Initializing Models...")
-
-# 1. DI-Retinex
+print("Initializing AI Models...")
 net = mymodel.enhance_net_nopool(6, 64).to(device)
-net.load_state_dict(torch.load("./DI-Retinex/weights/model.pth", map_location=device, weights_only=True))
+net.load_state_dict(torch.load("./DI-Retinex/weights/latest (21.54 lolv1).pth", map_location=device, weights_only=True))
 net.eval()
 
-# 2. InsightFace
-app_face = FaceAnalysis(name="buffalo_sc", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-app_face.prepare(ctx_id=0, det_size=(320, 320))
+app = FaceAnalysis(name="buffalo_sc", providers=["CUDAExecutionProvider"])
+app.prepare(ctx_id=0, det_size=(320, 320))
 
-# 3. OpenFace
 model = MultitaskPredictor(model_path="./OpenFace/weights/MTL_backbone.pth", device=device)
 
-# 4. MediaPipe
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=True, 
@@ -118,7 +106,6 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_detection_confidence=0.5
 )
 
-# ================= PSFP & PCA SETUP =================
 MASTER_SFP = {
     "P1": 61, "P4": 291, "P9": 194, "P11": 418, "P10": 200, "P20": 164, 
     "P16": 168, "P17": 9, "P14": 118, "P15": 347, "P18": 130, "P19": 263, 
@@ -133,19 +120,6 @@ face_3d_points = np.array([
     (0.0, 0.0, 0.0), (0.0, -330.0, -65.0), (-225.0, 170.0, -135.0),
     (225.0, 170.0, -135.0), (-150.0, -150.0, -125.0), (150.0, -150.0, -125.0)
 ], dtype=np.float64)
-
-pca_frontal = PCA(n_components=PCA_COMPONENTS)
-pca_profile = PCA(n_components=PCA_COMPONENTS)
-
-import warnings
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
-    dummy_data_frontal = np.zeros((PCA_COMPONENTS + 1, 5760)) 
-    pca_frontal.fit(dummy_data_frontal)
-    dummy_data_profile = np.zeros((PCA_COMPONENTS + 1, 3456))
-    pca_profile.fit(dummy_data_profile)
-
-print("Models & PCA Ready.")
 
 def get_active_patches(yaw_angle):
     if -22.5 <= yaw_angle <= 22.5: return SFP_FRONTAL, "FRONTAL"
@@ -171,56 +145,87 @@ def extract_psfp_patch(image, center_x, center_y, M=32, N=32):
 
 def extract_hog_features(patch):
     gray_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-    features = hog(
+    return hog(
         gray_patch, orientations=8, pixels_per_cell=(8, 8),
         cells_per_block=(2, 2), block_norm='L2-Hys',
         visualize=False, feature_vector=True
     )
-    return features
 
-# ================= STATE & UI BUFFERS =================
-frame_count = 0
-has_face = False
-last_bbox = (0, 0, 0, 0)
-last_emotion = 0
-last_emotion_array = np.array([]) 
-last_gaze_center = (0, 0)
-last_gaze_end = (0, 0)
-last_gaze_vector = [0.0, 0.0]
+# ================= PCA INITIALIZATION =================
+print("Initializing PCA Models...")
+pca_frontal = PCA(n_components=PCA_COMPONENTS)
+pca_profile = PCA(n_components=PCA_COMPONENTS)
 
-# UI Thread Synchronization
-ui_lock = threading.Lock()
-latest_render_frame = None
-latest_render_canvas = None
+dummy_data_frontal = np.zeros((PCA_COMPONENTS + 1, 5760)) 
+pca_frontal.fit(dummy_data_frontal)
 
-# ================= FASTAPI SETUP =================
-app = FastAPI()
+dummy_data_profile = np.zeros((PCA_COMPONENTS + 1, 3456))
+pca_profile.fit(dummy_data_profile)
+print("PCA Ready.")
 
-@app.post("/images")
-async def process_image(request: Request):
-    global frame_count, has_face, last_bbox, last_emotion, last_emotion_array
-    global last_gaze_center, last_gaze_end, last_gaze_vector
-    global latest_render_frame, latest_render_canvas
+
+# ================= GATHER IMAGE SEQUENCES =================
+print("Scanning for JPG images...")
+all_jpgs = glob.glob(os.path.join(DAISEE_IMAGE_PATH, "**", "*.jpg"), recursive=True)
+
+if not all_jpgs:
+    print(f"No JPG files found in {DAISEE_IMAGE_PATH}. Please verify the path.")
+    sys.exit()
+
+# Group images by their immediate parent directory
+folder_groups = {}
+for file_path in all_jpgs:
+    parent_dir = os.path.dirname(file_path)
+    if parent_dir not in folder_groups:
+        folder_groups[parent_dir] = []
+    folder_groups[parent_dir].append(file_path)
+
+# Sort folders and naturally sort the frame filenames inside them
+sorted_folders = sorted(folder_groups.keys())
+for p_dir in sorted_folders:
+    folder_groups[p_dir].sort(key=natural_sort_key)
+
+print(f"Found {len(all_jpgs)} total frames across {len(sorted_folders)} directories.")
+
+
+# ================= PIPELINE LOOP =================
+# Start the gRPC connection right before we begin processing
+grpc_channel = start_grpc_stream()
+
+patch_size = 32
+SKIP_FRAMES = 3 
+fps_log = []
+
+for folder_idx, folder_path in enumerate(sorted_folders):
+    # Get the folder name directly (e.g., "1100011002")
+    folder_name = os.path.basename(folder_path)
     
-    # Access globals for gRPC predictions
-    global latest_prediction, latest_probabilities
+    # Skip processing if the folder name is non-numeric (e.g., hidden system folders)
+    if not folder_name.isdigit():
+        print(f"Skipping non-numeric folder: {folder_name}")
+        continue
+        
+    folder_id_int = int(folder_name)
+    print(f"\n[{folder_idx+1}/{len(sorted_folders)}] Processing Folder ID: {folder_id_int}")
+    
+    # Reset trackers and baseline state fields for each sequence
+    face_tracker = SmoothTracker(alpha=0.5)
+    frame_count = 0
+    has_face = False
+    last_bbox = (0, 0, 0, 0)
+    last_emotion = 0
+    last_emotion_array = np.array([]) 
+    last_gaze_center = (0, 0)
+    last_gaze_end = (0, 0)
+    last_gaze_vector = [0.0, 0.0]
 
-    try:
-        data = await request.json()
-        b64_frame = data.get("image", "")
-
-        if "," in b64_frame:
-            b64_frame = b64_frame.split(",")[1]
-
-        frame_bytes = base64.b64decode(b64_frame)
-        np_arr = np.frombuffer(frame_bytes, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-        if frame is None:
-            return {"status": "decode_failed"}
-
-        frame_count += 1
+    for img_path in folder_groups[folder_path]:
         start = time.perf_counter()
+        frame_count += 1
+
+        frame = cv2.imread(img_path)
+        if frame is None:
+            continue
 
         frame = cv2.resize(frame, (640, 480))
 
@@ -240,7 +245,7 @@ async def process_image(request: Request):
 
         # 2. FRAME SKIPPING / OPENFACE
         if frame_count % SKIP_FRAMES == 1 or not has_face:
-            faces = app_face.get(result)
+            faces = app.get(result)
 
             if len(faces) > 0:
                 has_face = True
@@ -255,8 +260,7 @@ async def process_image(request: Request):
 
                 if face_crop.size > 0:
                     emotion_logits, gaze_output, au_output = model.predict(face_crop)
-                    if hasattr(emotion_logits, "detach"): 
-                        emotion_logits = emotion_logits.detach().cpu().numpy()
+                    if hasattr(emotion_logits, "detach"): emotion_logits = emotion_logits.detach().cpu().numpy()
                     
                     last_emotion_array = emotion_logits.flatten()
                     last_emotion = int(np.argmax(last_emotion_array))
@@ -267,8 +271,7 @@ async def process_image(request: Request):
                     last_gaze_vector = [gaze_left, gaze_right]
                     
                     last_gaze_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                    last_gaze_end = (int(last_gaze_center[0] + gaze_left * 150), 
-                                     int(last_gaze_center[1] - gaze_right * 150))
+                    last_gaze_end = (int(last_gaze_center[0] + gaze_left * 150), int(last_gaze_center[1] - gaze_right * 150))
             else:
                 has_face = False
 
@@ -339,94 +342,42 @@ async def process_image(request: Request):
                 if last_emotion_array.size > 0:
                     grpc_payload = np.concatenate((reduced_data, last_emotion_array, last_gaze_vector)).tolist()
 
-                # Render SFP canvas
+                # Render SFP canvas locally
                 row, col = 0, 0
                 for patch_name in extracted_patches.keys():
-                    rgb_patch = extracted_patches[patch_name]
-                    canvas[row*patch_size:(row+1)*patch_size, col*patch_size:(col+1)*patch_size] = rgb_patch
+                    rgb = extracted_patches[patch_name]
+                    canvas[row*patch_size:(row+1)*patch_size, col*patch_size:(col+1)*patch_size] = rgb
                     col += 1
                     if col >= 5: col, row = 0, row + 1
 
-        # 4. gRPC STREAMING (UPDATED FOR BIDIRECTIONAL)
+        # 4. gRPC STREAMING (Bidirectional block for training data)
         if len(grpc_payload) > 0:
-            req = data_pb2.FeatureRequest(id="fastapi_client", features=grpc_payload, timestamp=time.time_ns())
-            try:
-                # Push into queue instantly. Generator thread will pick it up and stream to server.
-                grpc_request_queue.put_nowait(req)
-            except queue.Full:
-                pass  # Skip frame payload if stream is completely backed up
+            req = data_pb2.FeatureRequest(features=grpc_payload, timestamp=time.time_ns(), id=str(folder_id_int))
+            # Notice we use .put() instead of .put_nowait().
+            # If the server is slow, this script will briefly pause instead of skipping frames, 
+            # ensuring 100% of your training dataset gets transferred and logged.
+            grpc_request_queue.put(req)
 
-        # 5. FPS & UI CACHE UPDATE
+        # 5. DISPLAY
         fps = 1.0 / (time.perf_counter() - start)
+        fps_log.append(fps)
         cv2.putText(result, f"FPS: {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        # --- DRAW SERVER PREDICTIONS ON FRAME ---
-        cv2.putText(result, f"Server Pred: {latest_prediction}", (20, 110), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-        
-        # Draw probabilities if they are populated
-        if sum(latest_probabilities) > 0:
-            for idx, prob in enumerate(latest_probabilities):
-                cv2.putText(result, f"Class {idx}: {prob*100:.1f}%", (20, 140 + (idx*25)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(result, f"Folder ID: {folder_name}", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        cv2.putText(result, f"Frame: {frame_count}", (20, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
-        
+        cv2.imshow("Main Feed", result)
+        cv2.imshow("Active SFP Patches", canvas)
 
-        # Update monitoring window cache
-        with ui_lock:
-            latest_render_frame = result.copy()
-            latest_render_canvas = canvas.copy()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("Processing interrupted by user.")
+            cv2.destroyAllWindows()
+            grpc_request_queue.put(None) # Close stream cleanly
+            sys.exit()
 
-        # Added prediction text to API response
-        return {
-            "status": "success", 
-            "engagement_score": latest_probabilities
-        }
+if len(fps_log) > 0: 
+    print(f"\nFinished processing. Average FPS: {sum(fps_log) / len(fps_log):.2f}")
 
-    except Exception as e:
-        print("ERROR:", e)
-        return {"status": "error", "message": str(e)}
-
-# ================= RUNNER =================
-def run_fastapi():
-    print("Starting FastAPI API engine on port 3000...")
-    uvicorn.run(app, host="0.0.0.0", port=3000, log_level="warning")
-
-if __name__ == "__main__":
-    
-    # 1. Initialize Bidirectional Streaming
-    start_grpc_stream()
-    
-    # 2. Start the API processing listener thread
-    server_thread = threading.Thread(target=run_fastapi, daemon=True)
-    server_thread.start()
-
-    print("\n" + "="*50)
-    print(" MONITORING WINDOW ACTIVE")
-    print(" Displaying incoming API frames context.")
-    print(" Press 'q' inside a monitoring window to terminate.")
-    print("="*50 + "\n")
-
-    # Placeholder screen while API waiting for data
-    waiting_screen = np.zeros((480, 640, 3), dtype=np.uint8)
-    cv2.putText(waiting_screen, "Waiting for API stream...", (130, 240), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-
-    # Indefinite Main Thread rendering loop
-    while True:
-        with ui_lock:
-            if latest_render_frame is not None:
-                cv2.imshow("Main Feed (API Stream)", latest_render_frame)
-            else:
-                cv2.imshow("Main Feed (API Stream)", waiting_screen)
-
-            if latest_render_canvas is not None:
-                cv2.imshow("Active SFP Patches (API Stream)", latest_render_canvas)
-
-        if cv2.waitKey(20) & 0xFF == ord('q'):
-            print("Stopping monitor windows...")
-            # Signal generator to close down
-            grpc_request_queue.put(None)
-            break
-
-    cv2.destroyAllWindows()
+# Cleanup gRPC tunnel on completion
+print("Shutting down gRPC tunnel...")
+grpc_request_queue.put(None)
+cv2.destroyAllWindows()
